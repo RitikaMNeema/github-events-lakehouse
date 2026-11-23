@@ -12,8 +12,8 @@ help: ## Show this help
 # ---------- lifecycle ----------
 up: ## Build and start the stack (Docker Desktop must be running)
 	$(DC) up -d --build
-	@echo "Airflow  http://localhost:8081  (admin/admin)"
-	@echo "MinIO    http://localhost:9001  (see .env)"
+	@echo "Airflow  http://localhost:8085  (admin/admin)"
+	@echo "S3       http://localhost:8333  (SeaweedFS; master UI :9333)"
 	@echo "Trino    http://localhost:8080"
 
 down: ## Stop the stack, keep data
@@ -30,6 +30,9 @@ logs: ## Tail scheduler logs
 
 shell: ## Shell inside the pipeline container
 	$(DC) exec airflow-scheduler bash
+
+smoke: ## Validate the stack end to end (Spark -> Iceberg -> S3). Run this first.
+	$(EXEC) python tests/smoke_stack.py
 
 # ---------- pipeline, runnable without Airflow ----------
 profile: ## Measure real file sizes / row counts for the docs
@@ -84,6 +87,6 @@ backfill: ## Backfill a date range through Airflow. START=.. END=..
 	$(DC) exec -T airflow-scheduler airflow dags backfill \
 	  --start-date $(START) --end-date $(END) gharchive_ingest
 
-.PHONY: help up down nuke ps logs shell profile ingest bronze silver compact \
+.PHONY: help up down nuke ps logs shell smoke profile ingest bronze silver compact \
         dbt-deps dbt-run dbt-snapshot quality throughput expire-raw expire-raw-apply \
         all idempotency benchmark incident backfill

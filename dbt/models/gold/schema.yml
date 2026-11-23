@@ -43,6 +43,9 @@ models:
                 - PublicEvent
                 - CommitCommentEvent
                 - GollumEvent
+                # Observed in 2026 data, absent from older hours.
+                - DiscussionEvent
+                - DiscussionCommentEvent
       - name: repo_id
         description: FK to dim_repo.
         tests:

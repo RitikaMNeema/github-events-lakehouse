@@ -39,7 +39,7 @@ class Settings:
     def from_env() -> "Settings":
         return Settings(
             bucket=os.environ.get("LAKE_BUCKET", "lakehouse"),
-            s3_endpoint=os.environ.get("S3_ENDPOINT", "http://minio:9000"),
+            s3_endpoint=os.environ.get("S3_ENDPOINT", "http://seaweedfs:8333"),
             access_key=os.environ["AWS_ACCESS_KEY_ID"],
             secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
             region=os.environ.get("AWS_REGION", "us-east-1"),

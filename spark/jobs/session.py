@@ -1,4 +1,4 @@
-"""SparkSession wired to the Iceberg JDBC catalog over MinIO.
+"""SparkSession wired to the Iceberg JDBC catalog over S3-compatible storage.
 
 Two filesystem paths are configured on purpose:
   * Iceberg tables use S3FileIO  (s3://)  - the native, faster path.
@@ -69,6 +69,11 @@ def build(app_name: str, cfg: Settings | None = None) -> SparkSession:
             "spark.hadoop.fs.s3a.aws.credentials.provider",
             "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
         )
+        # Non-AWS S3 implementations do not always reproduce AWS ETag
+        # semantics, which S3A change detection assumes. Disabling it avoids
+        # spurious "file changed during read" failures.
+        .config("spark.hadoop.fs.s3a.change.detection.mode", "none")
+        .config("spark.hadoop.fs.s3a.change.detection.version.required", "false")
     )
     spark = b.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")

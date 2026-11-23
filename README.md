@@ -61,15 +61,22 @@ default 48-hour slice.
 
 ```bash
 cp .env.example .env     # adjust GHA_START / GHA_END for the slice you want
-make up                  # build and start: Postgres, MinIO, Trino, Airflow
+make up                  # build and start: Postgres, SeaweedFS, Trino, Airflow
+make smoke               # VALIDATE THE STACK FIRST: Spark -> Iceberg -> S3
 make profile             # measure the dataset -> docs/_measured/
 make all                 # ingest -> bronze -> silver -> dbt -> quality gate
 ```
 
+`make smoke` is not optional ceremony. It separates "the stack is
+misconfigured" from "my pipeline logic is wrong", which otherwise fail in
+indistinguishable ways -- a missing jar and a bad predicate both just
+produce a stack trace.
+
 | Service | URL | Credentials |
 |---|---|---|
-| Airflow | http://localhost:8081 | `admin` / `admin` |
-| MinIO console | http://localhost:9001 | see `.env` |
+| Airflow | http://localhost:8085 | `admin` / `admin` |
+| SeaweedFS (S3 API) | http://localhost:8333 | see `.env` |
+| SeaweedFS master UI | http://localhost:9333 | none |
 | Trino | http://localhost:8080 | no auth (local only) |
 
 `make help` lists every target. `make nuke` deletes all data and metadata.
@@ -250,12 +257,20 @@ credible.
 - **No streaming layer yet.** See above.
 - **No alerting.** The quality gate fails the DAG and writes a report;
   nothing pages anyone.
-- **Image tags.** Some images are pinned and some are not. Run
-  `docker compose pull` and pin anything that drifts before you call this
-  reproducible.
-- **Trino's Iceberg JDBC catalog** is a less-travelled configuration than
-  REST or Glue. If `make dbt-run` cannot see the Spark-written tables, this
-  is the first thing to check.
+- **Image tags.** `seaweedfs` and `aws-cli` track `latest`. Pin them before
+  calling this reproducible. MinIO is deliberately absent: it has been
+  withdrawn from Docker Hub (`minio/minio` now 404s) and quay.io does not
+  permit anonymous tag listing, so it cannot be pulled without guessing a
+  RELEASE string.
+- **Trino's Iceberg JDBC catalog** will not create its own metadata tables,
+  unlike Spark's. `conf/postgres/01-iceberg-catalog.sql` creates them at
+  database init to remove that ordering dependency. If you bump the Iceberg
+  version and Trino starts reporting *"Cannot check and eventually update
+  SQL schema"*, re-capture that DDL from a Spark-initialised catalog.
+- **Source data is degraded after ~2023.** Measured 2026-11-01-12 carried
+  4,720 events with no `PushEvent` at all, against 198,897 events and 62%
+  `PushEvent` for 2023-06-15-12. The default range in `.env` is historical
+  for that reason; recent data leaves `silver.commits` empty.
 
 ---
 
@@ -265,7 +280,7 @@ credible.
 ingest/     fetch_gharchive.py   idempotent downloader + manifest
             profile_slice.py     measures the dataset
             common.py            config, S3, manifest helpers
-spark/jobs/ session.py           SparkSession wired to Iceberg + MinIO
+spark/jobs/ session.py           SparkSession wired to Iceberg + S3
             bronze_raw_to_iceberg.py
             silver_events.py     normalisation, typing, quarantine, MERGE
             compaction.py        rewrite files, expire snapshots
