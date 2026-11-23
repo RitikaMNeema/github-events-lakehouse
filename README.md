@@ -131,6 +131,24 @@ straight into object storage — so **disk constrains what you retain, not
 what you process**. Raw is then expired once bronze is provably lossless,
 which is how real platforms do tiered retention.
 
+**Measured**, one hour of 2023-06-15 (62 MB gzipped source, 145,538 events):
+
+| Layer | On disk | Share of retained |
+|---|---|---|
+| `bronze.gh_events` | 44.4 MB | 77% |
+| `silver.commits` | 9.7 MB | 17% |
+| `silver.events` | 3.9 MB | 7% |
+
+`silver.events` is **16× smaller** than the compressed source for the same
+rows. But total retention is **93.5%** of source volume, because bronze
+keeps `payload` whole — a deliberate choice that buys replayability, and the
+reason the headline ratio looks unimpressive.
+
+So the levers rank: expiring raw frees 62 MB of 120 MB, but **bronze, not
+raw, is the larger remaining target**. Tiering it — keep `payload_json` hot
+for N days, then drop the column and rely on silver — is the real saving at
+scale, and the real trade, since it ends unlimited replay.
+
 | Target | Command |
 |---|---|
 | See what could be expired, and why not | `make expire-raw` (dry run) |

@@ -86,10 +86,24 @@ These are properties of the source, not bugs. Each one is a wrong number
 waiting to happen.
 
 1. **`WatchEvent` means starred, not watching.** Exposed as `is_star`.
-2. **`PushEvent.commits` is truncated by the source** to roughly the first
-   20 commits. `fct_events.commit_count` carries the true total from
-   `payload.size`. Counting rows in `silver.commits` **undercounts**, and
-   the undercount is invisible unless you know to look for it.
+2. **`PushEvent.commits` is truncated by the source at exactly 20 commits.**
+   `fct_events.commit_count` carries the true total from `payload.size`.
+   Counting rows in `silver.commits` undercounts, and the undercount is
+   invisible unless you know to look for it.
+
+   Measured on 2023-06-15 hour 00 (145,538 events, 89,273 pushes):
+
+   | Measure | Value |
+   |---|---|
+   | True commits, `sum(payload.size)` | 244,660 |
+   | Rows in `silver.commits` | 135,475 |
+   | **Undercount** | **109,185 (44.63%)** |
+   | Pushes exceeding 20 commits | 888 |
+   | Largest push | 1,000 commits, 20 rows retrieved |
+
+   The cap of 20 is empirical, not documented: the largest push in this hour
+   reported 1,000 commits and yielded exactly 20 array entries. Treat
+   `silver.commits` as a **sample** of commits, never a census.
 3. **Hours are genuinely missing upstream.** GitHub-side outages leave
    holes. These are recorded as `missing_upstream` in `ingest_manifest` and
    are not failures. A dip in `fct_repo_daily` may be a real source gap —

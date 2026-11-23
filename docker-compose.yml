@@ -93,9 +93,20 @@ services:
 
   trino:
     image: trinodb/trino:468
+    # Trino's default jvm.config uses -XX:MaxRAMPercentage=80 with NO
+    # container limit, so it sized its heap against the whole Docker VM
+    # (~6.2 GiB of 7.7) and the kernel OOM-killed it mid-dbt-build
+    # (exit 137). The JVM is cgroup-aware, so capping the container caps
+    # the heap: 80% of 2.5G is ~2G, which is ample for this data volume.
+    # 4g, not 2.5g: the heap is pinned at 2G in conf/trino/jvm.config, and
+    # the rest is headroom for metaspace, code cache, direct buffers and
+    # thread stacks -- all of which count against the same cgroup limit.
+    # A cap is not a reservation; actual idle usage is well under this.
+    mem_limit: 4g
     ports: ["8080:8080"]
     volumes:
       - ./conf/trino/catalog:/etc/trino/catalog:ro
+      - ./conf/trino/jvm.config:/etc/trino/jvm.config:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,6 +130,7 @@ services:
   airflow-webserver:
     <<: *airflow-common
     command: webserver
+    mem_limit: 1g
     ports: ["8085:8080"]
     depends_on:
       airflow-init:
@@ -128,6 +140,9 @@ services:
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
+    # Spark runs in-process here (local[*]). Bounded so a Spark job and a
+    # concurrent Trino query cannot together exceed the Docker VM.
+    mem_limit: 3g
     depends_on:
       airflow-init:
         condition: service_completed_successfully

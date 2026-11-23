@@ -74,6 +74,51 @@ def table_stats(spark, fq: str) -> dict | None:
         return None
 
 
+
+def _structure_note(present: dict, processed: int, retained: int) -> str:
+    """Explain WHICH layer dominates retention, rather than hand-waving.
+
+    A single headline ratio hides the thing that matters. Measured on one
+    hour, bronze held 77% of all retained bytes because it keeps payload
+    JSON whole, while silver.events -- the same 145,538 rows, typed and
+    column-pruned -- was 16x smaller than the compressed source.
+
+    So the headline ratio is dominated by a deliberate choice (keep bronze
+    replayable), not by poor compression. Saying "the gap is column pruning"
+    would be wrong: the gap is small precisely BECAUSE we retain bronze.
+    """
+    if not present or not processed:
+        return ""
+    biggest = max(present.items(), key=lambda kv: kv[1]["bytes"])
+    name, stats = biggest
+    share = 100 * stats["bytes"] / retained if retained else 0
+    lines = [
+        f"`{name}` alone holds **{share:.0f}%** of retained bytes. That is a "
+        "deliberate choice, not a compression failure: bronze keeps `payload` "
+        "whole so a parser fix can re-derive silver without re-ingesting.",
+        "",
+    ]
+    ev = present.get("silver.events")
+    if ev and ev["bytes"]:
+        ratio = processed / ev["bytes"]
+        lines += [
+            f"The typed, column-pruned layer tells the real compression story: "
+            f"`silver.events` is **{human(ev['bytes'])}** for the same rows, "
+            f"**{ratio:.0f}x smaller** than the compressed source.",
+            "",
+            "Which means the retention levers rank:",
+            "",
+            "1. **Expire raw** once bronze is provably lossless -- frees the "
+            "full source volume.",
+            "2. **Then bronze is the next target**, being the largest "
+            "remaining layer. Tiering it (keep `payload_json` hot for N days, "
+            "then drop the column and rely on silver) is the real saving at "
+            "scale, and the real trade: it ends unlimited replay.",
+            "3. Compression and column pruning are already doing their job in "
+            "silver; there is little left to win there.",
+        ]
+    return "\n".join(lines)
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     argparse.ArgumentParser(description=__doc__).parse_args()
@@ -193,10 +238,9 @@ def main() -> int:
                 ],
                 f"| **total retained** | | **{human(retained)}** | |",
                 "",
-                f"Retention ratio: **{retention_pct:.1f}%** of source volume. "
-                "The gap is column pruning plus zstd on Parquet -- the reason "
-                "processing volume and storage footprint are different numbers, "
-                "and why only one of them belongs on a resume.",
+                f"Retention ratio: **{retention_pct:.1f}%** of source volume.",
+                "",
+                _structure_note(present, processed, retained),
                 "",
                 "## Claims these measurements support",
                 "",
