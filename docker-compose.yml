@@ -1,0 +1,159 @@
+# GH Archive Lakehouse - local stack.
+#
+# NOTE ON IMAGE TAGS: verify these resolve on your machine with
+#   docker compose pull
+# and pin anything that drifts. Reproducible builds matter; a scaffold
+# that won't pull matters more.
+#
+# Profiles:
+#   (default)  postgres, minio, trino, airflow
+#   spark      adds a standalone Spark master+worker for the distributed demo
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+  env_file: .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # Backfills are the point of this project; let several hours run at once
+    # but not so many that a laptop falls over.
+    AIRFLOW__CORE__PARALLELISM: "8"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
+    AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: "false"
+    PYTHONPATH: /opt/project
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/logs:/opt/airflow/logs
+    - ./ingest:/opt/project/ingest
+    - ./spark:/opt/project/spark
+    - ./dbt:/opt/project/dbt
+    - ./docs:/opt/project/docs
+    - ./tests:/opt/project/tests
+    - spark-ivy:/home/airflow/.ivy2
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:15
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./conf/postgres:/docker-entrypoint-initdb.d:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    env_file: .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: create the bucket and the zone prefixes.
+  minio-init:
+    image: minio/mc:latest
+    env_file: .env
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/$$LAKE_BUCKET &&
+      mc mb --ignore-existing local/$$LAKE_BUCKET/raw &&
+      mc mb --ignore-existing local/$$LAKE_BUCKET/warehouse &&
+      echo 'bucket ready'
+      "
+
+  trino:
+    image: trinodb/trino:468
+    ports: ["8080:8080"]
+    volumes:
+      - ./conf/trino/catalog:/etc/trino/catalog:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname admin --lastname admin --role Admin --email admin@example.com || true
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports: ["8081:8080"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---- optional: real distributed Spark, for the cluster story ----
+  spark-master:
+    profiles: ["spark"]
+    image: apache/spark:3.5.5
+    command: /opt/spark/sbin/start-master.sh
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    ports: ["7077:7077", "8082:8080"]
+
+  spark-worker:
+    profiles: ["spark"]
+    image: apache/spark:3.5.5
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: "4"
+      SPARK_WORKER_MEMORY: "4g"
+    depends_on: [spark-master]
+
+volumes:
+  pgdata:
+  miniodata:
+  spark-ivy:

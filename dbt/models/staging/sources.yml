@@ -1,0 +1,32 @@
+version: 2
+
+sources:
+  - name: silver
+    database: iceberg
+    schema: silver
+    description: >
+      Spark-written Iceberg tables. dbt reads these but never writes them;
+      ownership of silver belongs to the Spark jobs, and a single writer per
+      table is what keeps the lineage honest.
+    tables:
+      - name: events
+        description: One typed row per GitHub event, partitioned by event date.
+        loaded_at_field: processed_at
+        freshness:
+          warn_after: {count: 6, period: hour}
+          error_after: {count: 24, period: hour}
+        columns:
+          - name: event_id
+            description: Source-assigned event id. Unique across all time.
+            tests: [not_null, unique]
+          - name: event_ts
+            tests: [not_null]
+          - name: event_type
+            tests: [not_null]
+      - name: commits
+        description: >
+          Exploded from PushEvent.payload.commits. TRUNCATED BY THE SOURCE -
+          never use a row count here as a commit count. Use
+          events.commit_count.
+      - name: quarantine
+        description: Rows rejected by silver validation, retained for replay.

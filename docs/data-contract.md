@@ -1,0 +1,135 @@
+# Data contract: `iceberg.gold`
+
+What consumers of the gold layer can rely on, and what they cannot. If a
+change would break anything stated here, it is a breaking change and needs
+a version bump and a notice — not a quiet deploy.
+
+**Owner:** data engineering
+**Source of truth:** [GH Archive](https://www.gharchive.org/)
+**Serving engine:** Trino over Apache Iceberg
+
+---
+
+## Tables
+
+### `gold.fct_events`
+
+One row per public GitHub event.
+
+| Property | Guarantee |
+|---|---|
+| Grain | One row per `event_id`. Enforced by `unique` + `not_null` tests. |
+| Partitioning | `day(event_ts)`. Always filter on `event_ts` or `event_date`. |
+| Clustering | Sorted by `repo_id` within each partition. |
+| Late data | Absorbed for **3 days** after the event date via a MERGE on `event_id`. Beyond that window, a reprocess is required. |
+| Deletes | Append/update only. Rows are never removed except by an explicit backfill. |
+
+### `gold.fct_repo_daily`
+
+Daily rollup per repository. **Use this, not `fct_events`, for dashboards.**
+
+| Property | Guarantee |
+|---|---|
+| Grain | One row per (`repo_id`, `event_date`). |
+| Freshness | Yesterday's row exists by 04:00 UTC. |
+| Zero rows | A repo with no activity has **no row**, not a zero row. Outer-join against a date spine if you need dense series. |
+
+### `gold.dim_repo`
+
+Slowly-changing (Type 2) repository dimension.
+
+| Property | Guarantee |
+|---|---|
+| Grain | One row per (`repo_id`, `valid_from`). |
+| Current row | `is_current = true`. Exactly one per `repo_id`, asserted by `dbt/tests/assert_one_current_repo_row.sql`. |
+| Timeline | No gaps or overlaps, asserted by `dbt/tests/assert_no_scd_gaps.sql`. |
+| Open interval | `valid_to = 9999-12-31` for current rows, never `NULL`. |
+
+To join facts to the dimension **as it was at the time of the event**:
+
+```sql
+SELECT f.event_id, d.repo_name, d.org_login
+FROM gold.fct_events f
+JOIN gold.dim_repo  d
+  ON  f.repo_id  = d.repo_id
+  AND f.event_ts >= d.valid_from
+  AND f.event_ts <  d.valid_to
+WHERE f.event_date = DATE '2026-11-01';
+```
+
+Joining on `is_current` instead gives you today's name attached to last
+year's events. That is sometimes what you want. It is usually a bug.
+
+### `gold.dim_actor`
+
+**Type 1 by deliberate choice** — overwritten in place, no history. The
+event stream carries no reliable account-rename signal, so a Type 2 actor
+dimension would be fiction. Documented here so nobody "fixes" it later.
+
+---
+
+## Service levels
+
+| Measure | Target | Enforced by |
+|---|---|---|
+| Raw landed | Within 1 hour of the source hour closing | `gharchive_ingest` task SLA |
+| Gold freshness | Yesterday complete by 04:00 UTC | `gharchive_transform` schedule |
+| Silver freshness | Max 24 h since last processed row | `quality_gate.check_freshness` |
+| Quarantine rate | Under 0.5 % of rows | `quality_gate.check_quarantine` |
+| Completeness | All 24 hours of a day present before transform | `ExternalTaskSensor` |
+
+---
+
+## Known gotchas
+
+These are properties of the source, not bugs. Each one is a wrong number
+waiting to happen.
+
+1. **`WatchEvent` means starred, not watching.** Exposed as `is_star`.
+2. **`PushEvent.commits` is truncated by the source** to roughly the first
+   20 commits. `fct_events.commit_count` carries the true total from
+   `payload.size`. Counting rows in `silver.commits` **undercounts**, and
+   the undercount is invisible unless you know to look for it.
+3. **Hours are genuinely missing upstream.** GitHub-side outages leave
+   holes. These are recorded as `missing_upstream` in `ingest_manifest` and
+   are not failures. A dip in `fct_repo_daily` may be a real source gap —
+   check the manifest before investigating the pipeline.
+4. **The source format changed on 2015-01-01.** Rows carry `source_format`
+   (`v3` or `legacy`). Any analysis spanning that boundary should either
+   filter on `source_format` or confirm the field it uses is populated on
+   both sides.
+5. **Private activity is absent entirely.** This is the public event
+   stream. It is not a census of GitHub.
+6. **Timestamps are UTC.** Any "commits by hour of day" analysis measures
+   UTC, not local time, and will therefore mis-attribute contributor
+   working hours across time zones.
+
+---
+
+## Breaking vs non-breaking change
+
+**Breaking** (requires notice): removing or renaming a column, changing a
+column's type, changing the grain of a table, changing partitioning in a
+way that invalidates existing query predicates, narrowing the late-data
+window.
+
+**Non-breaking**: adding a column, adding a table, adding a test, changing
+file layout or compaction settings, widening the late-data window.
+
+---
+
+## Replaying quarantined rows
+
+Quarantined rows retain their original payload, so a parsing fix does not
+require re-downloading from the source:
+
+```sql
+SELECT reason, count(*)
+FROM silver.quarantine
+WHERE ingest_date = DATE '2026-11-01'
+GROUP BY reason ORDER BY 2 DESC;
+```
+
+Fix the parser in `spark/jobs/silver_events.py`, re-run silver for the
+affected range, and the MERGE on `event_id` makes the replay safe to
+repeat.

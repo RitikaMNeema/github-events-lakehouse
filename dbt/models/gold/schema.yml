@@ -1,0 +1,96 @@
+version: 2
+
+models:
+  - name: fct_events
+    description: >
+      One row per GitHub event. The grain of the warehouse. Partitioned by
+      day(event_ts), sorted by repo_id.
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "commit_count >= 0"
+      # A day with zero events means the pipeline is broken, not that
+      # GitHub went quiet. Catch it here rather than in a dashboard.
+      - dbt_utils.expression_is_true:
+          expression: "event_ts <= current_timestamp + interval '1' day"
+    columns:
+      - name: event_id
+        description: Natural key from the source. The merge key.
+        tests:
+          - not_null
+          - unique
+      - name: event_ts
+        tests: [not_null]
+      - name: event_type
+        tests:
+          - not_null
+          - accepted_values:
+              # Adding a value here is a deliberate act. If the source ships
+              # a new event type, this test fails and someone decides what it
+              # means - rather than it silently joining the "other" bucket.
+              values:
+                - PushEvent
+                - CreateEvent
+                - PullRequestEvent
+                - IssueCommentEvent
+                - WatchEvent
+                - IssuesEvent
+                - DeleteEvent
+                - ForkEvent
+                - PullRequestReviewEvent
+                - PullRequestReviewCommentEvent
+                - ReleaseEvent
+                - MemberEvent
+                - PublicEvent
+                - CommitCommentEvent
+                - GollumEvent
+      - name: repo_id
+        description: FK to dim_repo.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_repo')
+              field: repo_id
+      - name: is_star
+        description: WatchEvent. This is a STAR, not a repository watch.
+      - name: commit_count
+        description: >
+          True push size from payload.size. NOT a count of silver.commits
+          rows, which the source truncates.
+
+  - name: fct_repo_daily
+    description: Daily rollup per repository. The dashboard-facing table.
+    columns:
+      - name: repo_day_sk
+        tests: [not_null, unique]
+      - name: repo_id
+        tests:
+          - relationships:
+              to: ref('dim_repo')
+              field: repo_id
+      - name: events
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+              inclusive: true
+
+  - name: dim_repo
+    description: SCD Type 2 repository dimension. Filter is_current for latest.
+    tests:
+      # Exactly one current row per repo, and no gaps/overlaps in the
+      # validity timeline, are asserted by the singular tests in dbt/tests/:
+      #   assert_one_current_repo_row.sql, assert_no_scd_gaps.sql
+      - dbt_utils.expression_is_true:
+          expression: "valid_to > valid_from"
+    columns:
+      - name: repo_sk
+        tests: [not_null, unique]
+      - name: repo_id
+        tests: [not_null]
+      - name: valid_from
+        tests: [not_null]
+
+  - name: dim_actor
+    description: Type 1 actor dimension, by deliberate choice (see model SQL).
+    columns:
+      - name: actor_id
+        tests: [not_null, unique]
