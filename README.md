@@ -107,6 +107,46 @@ Why this source rather than a tidy benchmark dataset:
 
 ---
 
+## Scaling on data without scaling on disk
+
+Processing volume and storage footprint are different numbers, and only one
+of them is bounded by your laptop.
+
+```
+source JSON  ──stream──►  bronze (Parquet+zstd)  ──►  silver  ──►  gold
+   1.2 TB                      retained                             retained
+     │
+     └── raw object deleted once bronze provably holds the same information
+```
+
+The ingest path never writes to local disk — the HTTP response streams
+straight into object storage — so **disk constrains what you retain, not
+what you process**. Raw is then expired once bronze is provably lossless,
+which is how real platforms do tiered retention.
+
+| Target | Command |
+|---|---|
+| See what could be expired, and why not | `make expire-raw` (dry run) |
+| Actually reclaim the bytes | `make expire-raw-apply` |
+| The bytes-processed ledger | `make throughput` |
+
+**The safety property that makes this defensible:** bronze records
+`unmapped_keys` — every top-level source key the schema does **not**
+persist. While that is non-empty, bronze is not a lossless re-encoding, raw
+is still the only copy, and expiry is refused. Discarding a field requires
+an explicit `--discard-keys` argument that gets recorded in the report. The
+quality gate warns on the same signal, so upstream schema drift surfaces
+before it can cause data loss.
+
+`ingest_manifest.size_bytes` is never cleared on expiry, so the volume
+ledger outlives the data. `make throughput` reads it and emits both the
+claims the measurements support **and** the ones they don't — because a
+number you can't source is worse than no number.
+
+See the retention policy in [`docs/data-contract.md`](docs/data-contract.md).
+
+---
+
 ## Engineering decisions
 
 The part worth reading. Each of these was a choice with a cost.
@@ -136,6 +176,8 @@ Claims in this repo are backed by generated reports, not assertions.
 | [`partitioning_benchmark.md`](docs/_measured/partitioning_benchmark.md) | `make benchmark` | Three layouts, same queries, files pruned and wall time |
 | [`compaction_*.md`](docs/_measured/) | `make compact` | File count and size before/after, record count unchanged |
 | [`quality_report.md`](docs/_measured/quality_report.md) | `make quality` | Every check, its severity and its result |
+| [`throughput.md`](docs/_measured/throughput.md) | `make throughput` | Bytes processed vs. retained, and which claims that supports |
+| [`retention.md`](docs/_measured/retention.md) | `make expire-raw` | Which raw hours are redundant, and why the rest were kept |
 | [`incident-postmortem.md`](docs/incident-postmortem.md) | `make incident` | A deliberate corruption drill, what the gate caught, what it missed |
 
 `docs/_measured/` is gitignored — these are artefacts of a run on your

@@ -123,4 +123,46 @@ with DAG(
         doc_md="Rewrites small files and expires snapshots older than 7 days.",
     )
 
-    wait_for_ingest >> silver >> quality >> dbt_deps >> dbt_snapshot >> dbt_build >> compact
+    # Raw expiry, DRY RUN by default.
+    #
+    # Deliberately not armed. A DAG that deletes source data on a schedule
+    # needs someone to have decided that on purpose, so this reports what it
+    # WOULD remove and removes nothing. Add `--apply` to arm it, and only
+    # once you have read docs/_measured/retention.md and are satisfied with
+    # the refusal list.
+    expire_raw = BashOperator(
+        task_id="expire_raw_dry_run",
+        bash_command=(
+            f"cd {PROJECT} && python spark/jobs/expire_raw.py "
+            f"--start {DAY_START} --end {DAY_END} --min-age-hours 168"
+        ),
+        trigger_rule="all_success",
+        doc_md=(
+            "Reports which raw objects are redundant because bronze provably "
+            "holds the same information. Four gates: age, bronze coverage, "
+            "silver coverage, and losslessness (no unmapped top-level keys). "
+            "Dry-run: add --apply to actually reclaim the bytes."
+        ),
+    )
+
+    throughput = BashOperator(
+        task_id="throughput_ledger",
+        bash_command=f"cd {PROJECT} && python tests/report_throughput.py",
+        trigger_rule="all_done",
+        doc_md=(
+            "Bytes processed survives raw expiry in the manifest. This is the "
+            "ledger behind any volume claim."
+        ),
+    )
+
+    (
+        wait_for_ingest
+        >> silver
+        >> quality
+        >> dbt_deps
+        >> dbt_snapshot
+        >> dbt_build
+        >> expire_raw
+        >> compact
+        >> throughput
+    )

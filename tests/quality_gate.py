@@ -145,6 +145,37 @@ def check_volume(spark, cat, start, end, r: Results) -> None:
         r.add("PASS", "volume anomaly", f"all hours within tolerance of median {median:,}")
 
 
+def check_schema_drift(spark, cat, start, end, r: Results) -> None:
+    """Top-level source keys that bronze does not persist.
+
+    WARN, not ERROR: an unmapped key does not make existing rows wrong, it
+    means the source has grown a field we are not capturing. Failing the
+    DAG for that would be over-reacting. But it is loud, because it is the
+    signal that the upstream schema moved -- and `expire_raw.py` hard-refuses
+    to delete raw while it is true, since raw is then the only copy.
+    """
+    try:
+        found = spark.sql(
+            f"""SELECT DISTINCT explode(unmapped_keys) k
+                FROM {cat}.bronze.gh_events
+                WHERE ingest_date BETWEEN date'{start:%Y-%m-%d}'
+                                      AND date'{end:%Y-%m-%d}'"""
+        ).collect()
+    except Exception as exc:  # column absent on a pre-evolution table
+        r.add("WARN", "schema drift", f"could not evaluate: {exc}")
+        return
+    keys = sorted({x["k"] for x in found if x["k"]})
+    if keys:
+        r.add("WARN", "schema drift",
+              f"{len(keys)} unmapped top-level key(s) present: "
+              f"{', '.join(keys[:8])} - bronze is NOT lossless for these "
+              "rows, so raw expiry is blocked until they are mapped or "
+              "explicitly discarded")
+    else:
+        r.add("PASS", "schema drift",
+              "every top-level source key is persisted; bronze is lossless")
+
+
 def check_freshness(spark, cat, r: Results) -> None:
     row = spark.sql(f"SELECT max(processed_at) m FROM {cat}.silver.events").collect()[0]
     if row["m"] is None:
@@ -186,6 +217,7 @@ def main() -> int:
     check_uniqueness(spark, cat, start, end, r)
     check_quarantine(spark, cat, start, end, r)
     check_referential(spark, cat, r)
+    check_schema_drift(spark, cat, start, end, r)
     check_freshness(spark, cat, r)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)

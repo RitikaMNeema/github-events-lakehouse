@@ -118,6 +118,60 @@ file layout or compaction settings, widening the late-data window.
 
 ---
 
+## Retention policy
+
+Tiered, because processing volume and storage footprint are different
+problems. You do not have to store data to have processed it.
+
+| Zone | Retention | Rationale |
+|---|---|---|
+| Raw (`s3://.../raw/`) | **Expired once bronze is provably lossless**, minimum age 48 h (168 h in the DAG) | Redundant once every top-level source key is persisted in bronze. Until then it is the only copy of something. |
+| Bronze | Indefinite | The replay layer. Holds `payload` whole, so a parser fix re-derives silver without re-downloading. |
+| Silver | Indefinite | Typed, column-pruned, zstd. An order of magnitude smaller than raw. |
+| Gold | Indefinite | Smallest layer; what consumers read. |
+| Iceberg snapshots | 7 days | Time travel is not free. A deliberate trade against unlimited rollback. |
+
+### Raw expiry is gated, not scheduled
+
+`spark/jobs/expire_raw.py` deletes an hour's raw object only when all four
+hold:
+
+1. **Age** — older than `--min-age-hours`. A bug found tomorrow should still
+   be fixable from source.
+2. **Bronze coverage** — rows exist in bronze whose `source_file` is that
+   object.
+3. **Silver coverage** — the hour cleared normalisation and the quality gate.
+4. **Losslessness** — no row in the hour reports an unmapped top-level key.
+
+Gate 4 is the one that matters. `bronze.gh_events.unmapped_keys` records any
+top-level source key the schema does not persist. While that array is
+non-empty, bronze is **not** a lossless re-encoding of those records, raw is
+still the only copy, and expiry is refused. Discarding a field therefore
+requires an explicit `--discard-keys` argument, recorded in
+`docs/_measured/retention.md`.
+
+The job is **dry-run by default**, and the Airflow task is deliberately not
+armed with `--apply`.
+
+### Bytes processed survives expiry
+
+`ingest_manifest.size_bytes` is never cleared when an object is deleted.
+Once raw is gone it is the only record of how much source data moved through
+the pipeline, so it is the ledger behind every volume claim. See
+`tests/report_throughput.py`, which also states which claims the numbers do
+**not** support.
+
+### In production this would be a lifecycle rule
+
+On real S3 you would expire raw with an S3 Lifecycle policy rather than a
+Spark job — cheaper, and no compute to schedule. The explicit job exists
+here because a lifecycle rule expires on **age alone**, with no idea whether
+anything downstream actually captured the data. The gated job trades
+operational simplicity for the guarantee that nothing is deleted before it
+is provably redundant.
+
+---
+
 ## Replaying quarantined rows
 
 Quarantined rows retain their original payload, so a parsing fix does not

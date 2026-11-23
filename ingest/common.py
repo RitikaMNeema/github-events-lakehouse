@@ -157,3 +157,32 @@ def record(cfg: Settings, hour, url, key, size, etag, status) -> None:
             """,
             (hour, url, key, size, etag, status),
         )
+
+
+def mark_status(cfg: Settings, hour, status: str) -> None:
+    """Change an hour's status without disturbing size_bytes.
+
+    size_bytes is the permanent record of how many bytes passed through the
+    pipeline for that hour. It must survive raw expiry -- it IS the
+    bytes-processed ledger, and it is the only thing left once the object
+    is gone.
+    """
+    with pg_conn(cfg) as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE ingest_manifest SET status = %s, updated_at = now() "
+            "WHERE hour_ts = %s",
+            (status, hour),
+        )
+
+
+def manifest_rows(cfg: Settings, start, end) -> list[dict]:
+    with pg_conn(cfg) as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT hour_ts, object_key, size_bytes, status FROM ingest_manifest "
+            "WHERE hour_ts BETWEEN %s AND %s ORDER BY hour_ts",
+            (start, end),
+        )
+        return [
+            {"hour_ts": r[0], "object_key": r[1], "size_bytes": r[2], "status": r[3]}
+            for r in cur.fetchall()
+        ]

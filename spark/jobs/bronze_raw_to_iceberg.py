@@ -35,6 +35,33 @@ log = logging.getLogger("bronze")
 
 TABLE = "bronze.gh_events"
 
+# Exactly the top-level source keys this schema persists. Anything else a
+# record carries is recorded in `unmapped_keys` rather than silently dropped.
+#
+# This list is the contract that makes raw expiry safe: if it is complete,
+# bronze is a lossless re-encoding of the source record and the raw object
+# is redundant. If it is NOT complete, deleting raw destroys data nobody
+# knows existed. `expire_raw.py` refuses to delete while any row in the
+# hour reports an unmapped key.
+PERSISTED_KEYS = [
+    "id", "_id",          # event id (v3 / legacy)
+    "type",
+    "actor",
+    "repo", "repository",  # v3 / legacy
+    "org",
+    "payload",
+    "public",
+    "created_at",
+]
+
+_persisted_sql = ", ".join(f"'{k}'" for k in PERSISTED_KEYS)
+UNMAPPED_EXPR = (
+    "array_except("
+    "  coalesce(json_object_keys(value), cast(array() as array<string>)),"
+    f"  array({_persisted_sql})"
+    ")"
+)
+
 DDL = """
 CREATE TABLE IF NOT EXISTS {cat}.{tbl} (
     event_id      STRING    COMMENT 'GitHub event id; globally unique, the merge key',
@@ -46,6 +73,7 @@ CREATE TABLE IF NOT EXISTS {cat}.{tbl} (
     payload_json  STRING    COMMENT 'raw; shape varies by event_type',
     is_public     BOOLEAN,
     source_format STRING    COMMENT 'v3 | legacy',
+    unmapped_keys ARRAY<STRING> COMMENT 'top-level source keys NOT persisted by this schema; non-empty means bronze is lossy for this row and raw MUST NOT be expired',
     source_file   STRING    COMMENT 'provenance: which object this row came from',
     ingest_date   DATE      COMMENT 'partition: date of the source file',
     ingest_hour   INT       COMMENT 'partition: hour of the source file',
@@ -74,6 +102,18 @@ def main() -> int:
 
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {cfg.catalog}.bronze")
     spark.sql(DDL.format(cat=cfg.catalog, tbl=TABLE))
+
+    # Schema evolution, in anger rather than in theory. A table created
+    # before `unmapped_keys` existed gains it here without a rewrite --
+    # Iceberg tracks columns by id, so old files simply read back NULL.
+    existing = set(spark.table(f"{cfg.catalog}.{TABLE}").schema.fieldNames())
+    if "unmapped_keys" not in existing:
+        log.info("evolving %s: adding unmapped_keys", TABLE)
+        spark.sql(
+            f"ALTER TABLE {cfg.catalog}.{TABLE} "
+            "ADD COLUMNS (unmapped_keys ARRAY<STRING> COMMENT "
+            "'top-level source keys NOT persisted by this schema')"
+        )
 
     hours = list(hour_range(start, end))
     paths = [raw_path(cfg, f"{h:%Y-%m-%d}", f"{h:%H}") for h in hours]
@@ -104,6 +144,13 @@ def main() -> int:
         F.get_json_object(j, "$.payload").alias("payload_json"),
         (F.get_json_object(j, "$.public") == "true").alias("is_public"),
         F.when(legacy, F.lit("legacy")).otherwise(F.lit("v3")).alias("source_format"),
+        # Every top-level key the record carries, minus the ones we persist.
+        # Empty array => this row is fully captured and raw is redundant.
+        #
+        # Expressed as SQL rather than the functions API: json_object_keys
+        # has no guaranteed Python wrapper across Spark 3.x, and a bare
+        # array() has ambiguous element typing that array_except rejects.
+        F.expr(UNMAPPED_EXPR).alias("unmapped_keys"),
         F.col("source_file"),
         # Partition values come from the object path, not the event body, so
         # they are stable even when created_at is garbage.

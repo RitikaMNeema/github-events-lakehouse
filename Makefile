@@ -56,10 +56,19 @@ dbt-run: ## Build the gold star schema via Trino
 dbt-snapshot: ## Advance the SCD2 repo dimension
 	$(EXEC) bash -c "cd /opt/project/dbt && dbt snapshot --profiles-dir ."
 
+throughput: ## Bytes-processed ledger + the claims it supports
+	$(EXEC) python tests/report_throughput.py
+
+expire-raw: ## DRY RUN: show which raw hours could be expired, and why not
+	$(EXEC) python spark/jobs/expire_raw.py --from-env
+
+expire-raw-apply: ## DELETE raw for hours that pass all four safety gates
+	$(EXEC) python spark/jobs/expire_raw.py --from-env --apply
+
 quality: ## Run the standalone quality gate
 	$(EXEC) python tests/quality_gate.py --from-env
 
-all: ingest bronze silver dbt-deps dbt-snapshot dbt-run quality ## Full pipeline on the .env slice
+all: ingest bronze silver dbt-deps dbt-snapshot dbt-run quality throughput ## Full pipeline on the .env slice
 
 # ---------- the demos that make the project ----------
 idempotency: ## Prove reprocessing is safe: run bronze twice, compare counts
@@ -76,4 +85,5 @@ backfill: ## Backfill a date range through Airflow. START=.. END=..
 	  --start-date $(START) --end-date $(END) gharchive_ingest
 
 .PHONY: help up down nuke ps logs shell profile ingest bronze silver compact \
-        dbt-deps dbt-run dbt-snapshot quality all idempotency benchmark incident backfill
+        dbt-deps dbt-run dbt-snapshot quality throughput expire-raw expire-raw-apply \
+        all idempotency benchmark incident backfill
