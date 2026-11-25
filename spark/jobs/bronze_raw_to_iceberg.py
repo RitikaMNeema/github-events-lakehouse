@@ -22,13 +22,20 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import timezone
 
 from pyspark.sql import functions as F
 
 sys.path.insert(0, "/opt/project/ingest")
 sys.path.insert(0, "/opt/project/spark/jobs")
 
-from common import Settings, add_range_args, hour_range, resolve_range  # noqa: E402
+from common import (  # noqa: E402
+    Settings,
+    add_range_args,
+    hour_range,
+    manifest_rows,
+    resolve_range,
+)
 from session import build, raw_path  # noqa: E402
 
 log = logging.getLogger("bronze")
@@ -115,17 +122,91 @@ def main() -> int:
             "'top-level source keys NOT persisted by this schema')"
         )
 
-    hours = list(hour_range(start, end))
-    paths = [raw_path(cfg, f"{h:%Y-%m-%d}", f"{h:%H}") for h in hours]
+    # Read only hours the manifest says are actually in the raw zone.
+    #
+    # spark.read.text() raises PATH_NOT_FOUND on a path that does not exist,
+    # so passing every hour in the range crashes the batch the moment it
+    # spans a gap -- and GH Archive genuinely has gaps, plus any hour whose
+    # raw object has since been expired. A backfill must survive both.
+    #
+    # The manifest already knows which hours landed, so it is the authority
+    # here. `raw_expired` is excluded on purpose: the row was processed once
+    # and its object is deliberately gone.
+    available = {
+        m["hour_ts"].replace(tzinfo=timezone.utc): m
+        for m in manifest_rows(cfg, start, end)
+        if m["status"] in ("fetched", "present")
+    }
+    hours = [h for h in hour_range(start, end) if h in available]
+    skipped = [h for h in hour_range(start, end) if h not in available]
 
-    # Missing hours are expected (upstream gaps). Let Spark skip them rather
-    # than failing the batch.
-    df_raw = (
-        spark.read.option("recursiveFileLookup", "false")
-        .text(paths)
-        .withColumn("source_file", F.input_file_name())
-    )
+    if skipped:
+        log.warning(
+            "skipping %d hour(s) absent from the raw zone (gaps, unfetched or "
+            "expired): %s",
+            len(skipped),
+            ", ".join(f"{h:%m-%dT%H}" for h in skipped[:8]),
+        )
+    if not hours:
+        log.error(
+            "no fetched hours in range %s..%s - run ingest first",
+            f"{start:%Y-%m-%dT%H}", f"{end:%Y-%m-%dT%H}",
+        )
+        spark.stop()
+        return 1
 
+    log.info("processing %d hour(s), one at a time", len(hours))
+
+    target = f"{cfg.catalog}.{TABLE}"
+
+    # ONE HOUR PER WRITE, deliberately.
+    #
+    # Reading the whole range in a single pass made peak memory grow with
+    # the width of the range: six hours (~2.8 GB of uncompressed JSON) killed
+    # a 2 GB driver outright -- "Answer from Java side is empty", i.e. the
+    # JVM died rather than a query failing. A job that cannot widen its
+    # range without more RAM cannot backfill a year, which is the entire
+    # point of the thing.
+    #
+    # Looping makes peak memory a function of ONE hour, flat regardless of
+    # range. It also means each hour is its own Iceberg commit, so a failure
+    # half way through a backfill leaves every completed hour intact instead
+    # of losing the batch. Slightly more commits; vastly better failure
+    # behaviour. This is also exactly what the hourly DAG does per run, so
+    # the manual path and the orchestrated path now behave identically.
+    for i, h in enumerate(hours, 1):
+        path = raw_path(cfg, f"{h:%Y-%m-%d}", f"{h:%H}")
+        log.info("[%d/%d] %s", i, len(hours), f"{h:%Y-%m-%dT%H}")
+
+        df_raw = (
+            spark.read.option("recursiveFileLookup", "false")
+            # Belt and braces: an object deleted between the manifest read
+            # and the scan must not fail the batch either.
+            .option("ignoreMissingFiles", "true")
+            .text(path)
+            .withColumn("source_file", F.input_file_name())
+        )
+        _write_hour(spark, df_raw, target)
+
+    n = spark.sql(
+        f"""SELECT count(*) c FROM {target}
+            WHERE ingest_date BETWEEN date'{start:%Y-%m-%d}' AND date'{end:%Y-%m-%d}'"""
+    ).collect()[0]["c"]
+    log.info("bronze now holds %s rows for the requested range", f"{n:,}")
+
+    snap = spark.sql(
+        f"SELECT snapshot_id, operation FROM {target}.snapshots "
+        "ORDER BY committed_at DESC LIMIT 1"
+    ).collect()
+    if snap:
+        log.info("latest snapshot %s (%s)", snap[0]["snapshot_id"], snap[0]["operation"])
+
+    spark.stop()
+    return 0
+
+
+def _write_hour(spark, df_raw, target: str) -> None:
+    """Project one hour's raw lines into bronze and commit that partition."""
     j = F.col("value")
     legacy = F.get_json_object(j, "$.repository").isNotNull()
 
@@ -163,26 +244,14 @@ def main() -> int:
         F.current_timestamp().alias("ingested_at"),
     )
 
-    target = f"{cfg.catalog}.{TABLE}"
-    # Dynamic partition overwrite: replaces only the (ingest_date, ingest_hour)
-    # partitions present in this dataframe. Re-running is a no-op in effect.
-    bronze.sortWithinPartitions("event_type").writeTo(target).overwritePartitions()
-
-    n = spark.sql(
-        f"""SELECT count(*) c FROM {target}
-            WHERE ingest_date BETWEEN date'{start:%Y-%m-%d}' AND date'{end:%Y-%m-%d}'"""
-    ).collect()[0]["c"]
-    log.info("bronze now holds %s rows for the requested range", f"{n:,}")
-
-    snap = spark.sql(
-        f"SELECT snapshot_id, operation, summary FROM {target}.snapshots "
-        "ORDER BY committed_at DESC LIMIT 1"
-    ).collect()
-    if snap:
-        log.info("latest snapshot %s (%s)", snap[0]["snapshot_id"], snap[0]["operation"])
-
-    spark.stop()
-    return 0
+    # Dynamic partition overwrite: replaces only the (ingest_date,
+    # ingest_hour) partitions present in this dataframe. Re-running an hour
+    # is a no-op in effect, which is what makes reprocessing safe.
+    #
+    # No sortWithinPartitions: it forced a full sort of the hour in driver
+    # memory for a marginal clustering gain. Iceberg's own write ordering
+    # covers this if it is wanted, declared on the table rather than here.
+    bronze.writeTo(target).overwritePartitions()
 
 
 if __name__ == "__main__":

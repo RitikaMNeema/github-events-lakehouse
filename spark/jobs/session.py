@@ -37,7 +37,14 @@ def build(app_name: str, cfg: Settings | None = None) -> SparkSession:
         .master(cfg.spark_master)
         .config("spark.jars.packages", PACKAGES)
         .config("spark.driver.memory", cfg.driver_memory)
-        .config("spark.sql.shuffle.partitions", "32")
+        # More, smaller shuffle partitions: each task then holds less, and
+        # spills to disk instead of blowing the heap. 32 made individual
+        # tasks large enough to OOM a memory-capped driver.
+        .config("spark.sql.shuffle.partitions", "64")
+        # Let AQE coalesce them back down when the data is genuinely small,
+        # so the higher count costs nothing on narrow ranges.
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         # ---- Iceberg ----
         .config(
             "spark.sql.extensions",

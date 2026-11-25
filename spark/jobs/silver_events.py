@@ -27,7 +27,12 @@ from pyspark.sql import DataFrame, functions as F
 sys.path.insert(0, "/opt/project/ingest")
 sys.path.insert(0, "/opt/project/spark/jobs")
 
-from common import Settings, add_range_args, resolve_range  # noqa: E402
+from common import (  # noqa: E402
+    Settings,
+    add_range_args,
+    hour_range,
+    resolve_range,
+)
 from session import build  # noqa: E402
 
 log = logging.getLogger("silver")
@@ -163,24 +168,22 @@ def normalise(bronze: DataFrame) -> DataFrame:
     )
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    ap = add_range_args(argparse.ArgumentParser(description=__doc__))
-    args = ap.parse_args()
+def _process_hour(spark, cat: str, hour) -> None:
+    """Validate, normalise and merge ONE ingest hour into silver.
 
-    cfg = Settings.from_env()
-    start, end = resolve_range(args)
-    cat = cfg.catalog
-    spark = build("silver_events", cfg)
+    Scoped to a single hour on purpose. The whole-range version made peak
+    memory grow with how wide the request was, and six hours (~2.8 GB of
+    uncompressed JSON) killed a 2 GB driver outright -- the JVM died, not
+    the query ("Answer from Java side is empty"). A job that needs more RAM
+    to cover more time cannot backfill a year, which is the point of it.
 
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {cat}.silver")
-    for ddl in (EVENTS_DDL, COMMITS_DDL, QUARANTINE_DDL):
-        spark.sql(ddl.format(cat=cat))
-
+    Per-hour also means each hour is its own set of commits, so a failure
+    part way through a backfill leaves every completed hour intact.
+    """
     bronze = spark.table(f"{cat}.bronze.gh_events").where(
-        f"ingest_date BETWEEN date'{start:%Y-%m-%d}' AND date'{end:%Y-%m-%d}'"
+        f"ingest_date = date'{hour:%Y-%m-%d}' AND ingest_hour = {hour.hour}"
     )
-    log.info("reading %s bronze rows", f"{bronze.count():,}")
+    log.info("  reading %s bronze rows", f"{bronze.count():,}")
 
     # ---------------------------------------------------------- validation
     reason = (
@@ -233,7 +236,7 @@ def main() -> int:
         WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
         """
     )
-    log.info("merged events")
+    log.info("  merged events")
 
     # ------------------------------------------------------------ commits
     # `distinct` is a reserved word in Spark's DDL parser, hence the backticks.
@@ -286,7 +289,34 @@ def main() -> int:
         WHEN NOT MATCHED THEN INSERT *
         """
     )
-    log.info("merged commits")
+    log.info("  merged commits")
+
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    ap = add_range_args(argparse.ArgumentParser(description=__doc__))
+    args = ap.parse_args()
+
+    cfg = Settings.from_env()
+    start, end = resolve_range(args)
+    cat = cfg.catalog
+    spark = build("silver_events", cfg)
+
+    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {cat}.silver")
+    for ddl in (EVENTS_DDL, COMMITS_DDL, QUARANTINE_DDL):
+        spark.sql(ddl.format(cat=cat))
+
+    # One hour per pass; see _process_hour for why.
+    hours = list(hour_range(start, end))
+    log.info("processing %d hour(s), one at a time", len(hours))
+    for n, h in enumerate(hours, 1):
+        log.info("[%d/%d] %s", n, len(hours), f"{h:%Y-%m-%dT%H}")
+        _process_hour(spark, cat, h)
+        # Drop cached plans/temp views between hours. Without this, driver
+        # state accumulates across iterations and a long backfill dies
+        # part way through for reasons unrelated to any single hour.
+        spark.catalog.clearCache()
 
     for t in ("events", "commits", "quarantine"):
         c = spark.sql(f"SELECT count(*) c FROM {cat}.silver.{t}").collect()[0]["c"]

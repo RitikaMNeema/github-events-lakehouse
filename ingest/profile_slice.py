@@ -44,12 +44,22 @@ def profile_hour(hour: datetime) -> dict | None:
         top_keys: Counter[str] = Counter()
 
         # Count compressed bytes as they arrive, decompress on the fly.
+        #
+        # readinto, NOT read: io.BufferedReader drives a RawIOBase through
+        # readinto(), and RawIOBase leaves that unimplemented, so overriding
+        # only read() raises NotImplementedError from inside gzip's header
+        # parse. RawIOBase.read() is itself implemented in terms of
+        # readinto(), so defining readinto gives us both.
         class Counting(io.RawIOBase):
-            def read(self, n=-1):
+            def readinto(self, buf):
                 nonlocal gz_bytes
-                chunk = r.raw.read(n if n and n > 0 else 1 << 20)
-                gz_bytes += len(chunk)
-                return chunk
+                chunk = r.raw.read(len(buf))
+                if not chunk:
+                    return 0
+                n = len(chunk)
+                buf[:n] = chunk
+                gz_bytes += n
+                return n
 
             def readable(self):
                 return True

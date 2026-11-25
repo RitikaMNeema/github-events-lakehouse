@@ -167,6 +167,32 @@ requires an explicit `--discard-keys` argument, recorded in
 The job is **dry-run by default**, and the Airflow task is deliberately not
 armed with `--apply`.
 
+### Compaction: where it helps, and where it is a no-op
+
+Measured over 6 hours of 2023-06-15 (848,106 bronze rows):
+
+| Table | Partitioning | Before | After |
+|---|---|---|---|
+| `bronze.gh_events` | `(ingest_date, ingest_hour)` | 6 files, avg 46.8 MB | **unchanged — 0 rewritten** |
+| `silver.events` | `days(event_ts)` | 6 files, avg 3.8 MB | 1 file, 25.7 MB |
+| `silver.commits` | `days(event_ts)` | 6 files, avg 9.1 MB | 1 file, 56.6 MB |
+
+**Bronze has nothing to compact, by construction.** One source file maps to
+one `(ingest_date, ingest_hour)` partition, so every partition holds exactly
+one appropriately-sized file. The small-file problem arises when many writes
+land in the same partition — which is what happens in silver, where six
+hourly writes all fall inside one `days(event_ts)` partition.
+
+So compaction is a silver-and-gold concern here, not a bronze one. Running
+it on bronze is harmless and correctly does nothing.
+
+**Compaction grew total bytes**, by 13% on `silver.events` and 4% on
+`silver.commits`. That is expected and is the trade being made: it optimises
+**read planning** — one file footer to open instead of six — not storage
+size. Per-hour files had better dictionary and encoding locality than the
+merged file. Record counts are asserted identical before and after; the job
+fails if they move.
+
 ### Bytes processed survives expiry
 
 `ingest_manifest.size_bytes` is never cleared when an object is deleted.

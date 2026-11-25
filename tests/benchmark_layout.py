@@ -89,6 +89,37 @@ def files_touched(spark, cat: str, name: str, predicate: str | None) -> int:
     return spark.sql(q).collect()[0]["c"]
 
 
+
+def _pruning_caveat(lo, hi) -> str:
+    """Say plainly when the data slice cannot demonstrate partition pruning.
+
+    A day-partitioned table built from a single day of data has exactly ONE
+    partition, so a single-day predicate selects everything and prunes
+    nothing. Any speedup measured in that situation comes from file layout,
+    not from pruning -- and presenting it as a pruning result would be
+    straightforwardly misleading.
+    """
+    days = (hi.date() - lo.date()).days + 1
+    if days >= 2:
+        return (
+            f"> The slice spans **{days} days**, so the single-day predicate "
+            "genuinely prunes partitions and the files-pruned column below is "
+            "meaningful.\n\n"
+        )
+    return (
+        "> ## This slice CANNOT demonstrate partition pruning\n"
+        ">\n"
+        f"> The data spans a single day ({lo.date()}), so the day-partitioned\n"
+        "> table has exactly **one** partition and the single-day predicate\n"
+        "> selects all of it. Nothing is pruned.\n"
+        ">\n"
+        "> The timing differences below are therefore attributable to file\n"
+        "> layout and file count, **not** to partition pruning. To measure\n"
+        "> pruning, ingest at least two days (widen `GHA_END` in `.env`) and\n"
+        "> re-run. Until then, treat the partitioned-vs-unpartitioned gap as\n"
+        "> suggestive, not as evidence.\n\n"
+    )
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description=__doc__)
@@ -188,6 +219,7 @@ def main() -> int:
                 sep,
                 *body,
                 "",
+                _pruning_caveat(bounds["lo"], bounds["hi"]),
                 "## Reading these numbers",
                 "",
                 "* **Files after date prune** is the structural result. The "

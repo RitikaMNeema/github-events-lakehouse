@@ -12,6 +12,14 @@ dbt/target/
 dbt/dbt_packages/
 dbt/logs/
 .ipynb_checkpoints/
-docs/_measured/
+# docs/_measured/ is intentionally NOT ignored.
+#
+# These are the generated reports -- measured dataset profile, idempotency
+# evidence, partition benchmark, compaction before/after, quality gate,
+# throughput ledger. They are the difference between a repo that describes
+# a pipeline and one that proves it ran. Someone cloning this should see
+# the numbers without having to run anything.
+#
+# Regenerate with the matching make target; they are reproducible, not precious.
 # dbt writes a local anonymous-usage id here; not project state.
 dbt/.user.yml
