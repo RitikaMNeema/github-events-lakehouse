@@ -20,8 +20,11 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     # Backfills are the point of this project; let several hours run at once
     # but not so many that a laptop falls over.
-    AIRFLOW__CORE__PARALLELISM: "8"
-    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
+    # Deliberately low. Spark runs in-process in the scheduler, so each
+    # concurrent task can be another multi-GB JVM in this container's cgroup.
+    # See max_active_runs in airflow/dags/gharchive_ingest.py.
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "1"
     AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: "false"
     PYTHONPATH: /opt/project
   volumes:

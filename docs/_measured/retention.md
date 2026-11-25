@@ -1,6 +1,6 @@
 # Raw-zone retention
 
-**DRY RUN (nothing deleted)** -- 2026-11-25 06:06 UTC, range `2023-06-15T00` .. `2023-06-15T05`.
+**APPLIED** -- 2026-11-25 23:31 UTC, range `2023-06-15T00` .. `2023-06-15T00`.
 
 ## Policy
 
@@ -15,7 +15,7 @@
 | Source bytes processed (all time, this range) | 62.0 MB |
 | Hours expired | 1 |
 | Bytes reclaimed | 62.0 MB |
-| Raw still retained | 62.0 MB |
+| Raw still retained | 0.0 B |
 | Hours refused | 0 |
 
 ## Refusals

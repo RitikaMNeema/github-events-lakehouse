@@ -89,7 +89,19 @@ def main() -> int:
 
     data_keys = ["rows", "distinct_ids", "id_checksum", "payload_bytes", "source_files"]
     drift = {k: (before[k], after[k]) for k in data_keys if before[k] != after[k]}
-    ok = not drift and after["rows"] == after["distinct_ids"]
+
+    # Idempotency means ONLY this: the second pass left the data identical.
+    #
+    # An earlier version also required rows == distinct_ids, and failed with
+    # an empty drift dict -- data provably unchanged, yet reported "NOT
+    # idempotent". That assertion was simply wrong: bronze deliberately
+    # preserves the source byte-for-byte, INCLUDING the duplicate event_ids
+    # the source itself emits (14 in 1.67M rows, each twice, all inside a
+    # single hourly file). Silver is where deduplication belongs. Requiring
+    # uniqueness in bronze contradicted the project's own layer contract and
+    # conflated two unrelated properties.
+    ok = not drift
+    dupes = after["rows"] - after["distinct_ids"]
 
     rows_md = [
         f"| {k} | `{before[k]}` | `{after[k]}` | "
@@ -119,6 +131,17 @@ def main() -> int:
                 "| Measure | Pass 1 | Pass 2 | Verdict |",
                 "|---|---|---|---|",
                 *rows_md,
+                "",
+                "## Source duplicates are preserved, not a failure",
+                "",
+                f"Bronze holds **{dupes:,}** more rows than distinct "
+                f"`event_id`s. That is correct: the source emits a small "
+                "number of events twice within a single hourly file, and "
+                "bronze's job is to reproduce what arrived. Silver dedupes "
+                "on `event_id`, and the uniqueness test there passes. This "
+                "figure is identical across both passes, which is itself "
+                "part of the proof -- a reprocess that changed it would mean "
+                "rows were being created or dropped.",
                 "",
                 "## Metadata is expected to change",
                 "",

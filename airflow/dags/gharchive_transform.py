@@ -31,7 +31,7 @@ with DAG(
     description="Daily silver + gold build with a blocking quality gate",
     default_args=default_args,
     schedule="0 2 * * *",   # 02:00 UTC, after the day's hours have landed
-    start_date=pendulum.datetime(2026, 11, 1, tz="UTC"),
+    start_date=pendulum.datetime(2023, 6, 15, tz="UTC"),
     catchup=True,
     max_active_runs=1,       # gold builds are not safe to run concurrently
     tags=["gharchive", "silver", "gold", "dbt"],
