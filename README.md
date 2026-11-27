@@ -37,7 +37,7 @@ pipeline costs.
         ▼
   ┌──────────────────────────────────────────────────────────────┐
   │ SILVER   iceberg.silver.{events, commits, quarantine}        │
-  │ PARTITIONED BY days(event_ts)   <- re-keyed to EVENT time    │
+  │ PARTITIONED BY hours(event_ts)  <- re-keyed to EVENT time    │
   └──────────────────────────────────────────────────────────────┘
         │  tests/quality_gate.py   ──► non-zero exit stops the build
         │  dbt on Trino
@@ -186,6 +186,7 @@ The part worth reading. Each of these was a choice with a cost.
 | **Quality gate before dbt, not after** | A gate that runs after the gold build tells you that you have already published bad numbers. | A failed gate blocks the whole build, including the parts that were fine. |
 | **Quarantine table instead of dropping bad rows** | The payload is retained, so a parser fix can replay the rows without re-downloading. Silently dropping rows is how a dashboard is quietly wrong for a year. | An extra table to monitor, and quarantine can itself grow unnoticed. |
 | **`dim_repo` as SCD2, `dim_actor` as Type 1** | Repos get renamed and transferred, and the event log records the name as it was — Type 1 would rewrite history. The event stream carries no reliable account-rename signal, so a Type 2 actor dimension would be invented data. | Every fact-to-dimension join needs a validity-window predicate, which is easy to get wrong. |
+| **Tail tasks use `all_success`, never `all_done`** | `all_done` on the compaction and throughput tasks made them run even after the completeness sensor FAILED. Because they are the DAG's leaf tasks, their success marked the whole run **green** — while silver, the quality gate and dbt had never executed. A pipeline that reports success after its gate failed is worse than no pipeline: it lies to whatever is watching it. | Maintenance no longer runs on an unhealthy pipeline. "This task failing shouldn't fail the DAG" is what retries are for, not a licence to run after upstream failed. |
 | **Separate ingest and transform DAGs** | Ingest cadence is set by the source, transform cadence by consumers. Coupling them means a change to one forces a change to the other. | Needs a cross-DAG sensor, and a stuck sensor is its own failure mode. |
 
 ---

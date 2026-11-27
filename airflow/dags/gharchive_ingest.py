@@ -15,15 +15,14 @@ import pendulum
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
-# data_interval_START, not the logical date.
+# data_interval_start: for a scheduled or backfilled hourly run this EQUALS
+# the logical date, so the run dated 09:00 processes hour 09. The run fires
+# once the interval has closed, so the hour is complete at the source.
 #
-# For an @hourly DAG the run at logical date 06:00 covers the interval
-# 05:00 -> 06:00, so it processes hour 05: the hour that has just CLOSED and
-# is therefore complete at the source. Using the logical date instead would
-# reach for an hour the source has not finished publishing.
-#
-# Worth stating plainly because the off-by-one bites every time: a run
-# labelled 06:00 writes ingest_hour=05.
+# `airflow dags test <date>` is the exception: it assigns a shifted interval
+# (logical 08:00 -> data_interval_start 07:00). That is a property of that
+# command, NOT of this DAG, and it is easy to mistake for an off-by-one bug
+# here. Use a backfill to reason about which hour a run covers.
 HOUR = "{{ data_interval_start.strftime('%Y-%m-%dT%H') }}"
 PROJECT = "/opt/project"
 

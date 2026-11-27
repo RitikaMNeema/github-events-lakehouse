@@ -19,7 +19,7 @@ One row per public GitHub event.
 | Property | Guarantee |
 |---|---|
 | Grain | One row per `event_id`. Enforced by `unique` + `not_null` tests. |
-| Partitioning | `day(event_ts)`. Always filter on `event_ts` or `event_date`. |
+| Partitioning | `day(event_ts)` in gold. Silver is `hours(event_ts)`, matching its write batch. Always filter on `event_ts` or `event_date`. |
 | Clustering | Sorted by `repo_id` within each partition. |
 | Late data | Absorbed for **3 days** after the event date via a MERGE on `event_id`. Beyond that window, a reprocess is required. |
 | Deletes | Append/update only. Rows are never removed except by an explicit backfill. |
@@ -174,14 +174,23 @@ Measured over 6 hours of 2023-06-15 (848,106 bronze rows):
 | Table | Partitioning | Before | After |
 |---|---|---|---|
 | `bronze.gh_events` | `(ingest_date, ingest_hour)` | 6 files, avg 46.8 MB | **unchanged — 0 rewritten** |
-| `silver.events` | `days(event_ts)` | 6 files, avg 3.8 MB | 1 file, 25.7 MB |
-| `silver.commits` | `days(event_ts)` | 6 files, avg 9.1 MB | 1 file, 56.6 MB |
+| `silver.events` | `days(event_ts)` at the time | 6 files, avg 3.8 MB | 1 file, 25.7 MB |
+| `silver.commits` | `days(event_ts)` at the time | 6 files, avg 9.1 MB | 1 file, 56.6 MB |
 
 **Bronze has nothing to compact, by construction.** One source file maps to
 one `(ingest_date, ingest_hour)` partition, so every partition holds exactly
 one appropriately-sized file. The small-file problem arises when many writes
 land in the same partition — which is what happens in silver, where six
-hourly writes all fall inside one `days(event_ts)` partition.
+hourly writes all fall inside one partition.
+
+**These numbers predate a partitioning change.** Silver was `days(event_ts)`
+when they were measured and is now `hours(event_ts)`: merging one hour at a
+time against a day-grained target meant every merge rescanned the whole day,
+which made a 24-hour backfill quadratic and OOM-killed the driver. Aligning
+the partition grain with the batch grain made the cost proportional to the
+batch -- 24 hours now completes in 8m14s with flat per-hour cost. Re-run
+`make compact` to refresh the figures; with hourly partitions there are
+fewer files per partition to merge, so expect a smaller effect.
 
 So compaction is a silver-and-gold concern here, not a bronze one. Running
 it on bronze is harmless and correctly does nothing.

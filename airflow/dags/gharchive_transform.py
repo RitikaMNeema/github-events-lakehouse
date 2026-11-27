@@ -17,6 +17,18 @@ from airflow.operators.bash import BashOperator
 from airflow.sensors.external_task import ExternalTaskSensor
 
 PROJECT = "/opt/project"
+# The calendar day to process is data_interval_start's date.
+#
+# With cron "0 2 * * *" the interval is [prev fire, this fire] = 02:00 -> 02:00
+# and logical_date == data_interval_start, so the run that fires at 02:00 on
+# 06-16 has data_interval_start 06-15 02:00 and processes calendar day 06-15:
+# the day that finished two hours earlier. Correct.
+#
+# DO NOT validate this with `airflow dags test`. It assigns intervals that a
+# scheduled run would never get -- asked for 2023-06-15 it supplied
+# data_interval_start 2023-06-13 02:00, and the quality gate duly failed on a
+# day that was never ingested. Use `airflow dags backfill` for anything
+# date-sensitive; it applies the real timetable.
 DAY_START = "{{ data_interval_start.strftime('%Y-%m-%dT00') }}"
 DAY_END = "{{ data_interval_start.strftime('%Y-%m-%dT23') }}"
 
@@ -48,10 +60,53 @@ with DAG(
         allowed_states=["success"],
         failed_states=["failed", "upstream_failed"],
         # The 24 hourly runs whose data interval falls inside this day.
-        execution_date_fn=lambda dt: [dt.add(hours=h) for h in range(24)],
-        mode="reschedule",   # free the worker slot while waiting
-        poke_interval=300,
-        timeout=60 * 60 * 6,
+        #
+        # range(24): for a scheduled or backfilled run, Airflow sets
+        # data_interval_start EQUAL to the logical date, so the run dated
+        # 09:00 processes hour 09. Verified from backfill logs -- logical
+        # 01:00 ran `--start 2023-06-15T01`, logical 23:00 ran
+        # `--start 2023-06-15T23`.
+        #
+        # Beware `airflow dags test`: it assigns a DIFFERENT interval for the
+        # same date (logical 08:00 got data_interval_start 07:00), which looks
+        # exactly like an off-by-one in this DAG and is not. Do not "fix" this
+        # line on the strength of a `dags test` run, and do not mix
+        # `dags test` with a backfill over the same dates -- a DagRun created
+        # by the former keeps its interval through --reset-dagruns, so the
+        # backfill silently reprocesses the wrong hour and leaves a gap.
+        # start_of("day"), not dt directly.
+        #
+        # This DAG's schedule is "0 2 * * *", so its logical date is 02:00 --
+        # not midnight. Using dt as the anchor would look for ingest runs at
+        # 02:00..01:00-next-day: missing hours 00 and 01 of the very day it
+        # guards, while demanding two hours of the following day that have no
+        # business blocking it.
+        #
+        # Anchoring to the start of the day makes the sensor independent of
+        # whatever hour this DAG happens to be scheduled at.
+        execution_date_fn=lambda dt: [
+            dt.start_of("day").add(hours=h) for h in range(24)
+        ],
+        # poke, NOT reschedule.
+        #
+        # reschedule is the better production default -- it frees the worker
+        # slot between pokes -- but a reschedule-mode sensor as a DAG's first
+        # task DEAD-LOCKS `airflow dags backfill`:
+        #
+        #   ERROR - Backfill job dead-locked.
+        #
+        # The backfill job cannot make progress while the sensor defers. For a
+        # project whose central claim is that backfill and steady state run
+        # the SAME code path, a gate that deadlocks backfill is not a gate.
+        # So: hold the slot. With a 60s poke and a 1h timeout that is at most
+        # one occupied slot for an hour, which this DAG can afford.
+        mode="poke",
+        poke_interval=60,
+        # 1 hour, not 6. This DAG runs at 02:00 on a day whose hours all
+        # landed by 00:59. If they are not all there within an hour,
+        # something needs a human, and six hours of silent poking only
+        # delays finding that out.
+        timeout=60 * 60,
         doc_md="Blocks until all 24 hourly bronze loads for this day succeeded.",
     )
 
@@ -116,10 +171,20 @@ with DAG(
             f"cd {PROJECT} && python spark/jobs/compaction.py "
             "--table bronze.gh_events"
         ),
-        # Maintenance must never fail the data pipeline: the data is already
-        # correct, the files are just untidy.
-        trigger_rule="all_done",
-        retries=1,
+        # all_success, NOT all_done.
+        #
+        # all_done ran this task even when the completeness sensor had FAILED,
+        # and because this and throughput_ledger are the DAG's leaf tasks,
+        # their success marked the whole DagRun green -- while silver, the
+        # quality gate and dbt had never run at all. A pipeline that reports
+        # success after its gate failed is worse than no pipeline: it lies to
+        # whatever is watching it.
+        #
+        # The original intent was "a compaction failure should not fail the
+        # data pipeline". That is a statement about THIS task failing, not a
+        # licence to run after upstream failed. Retries cover the former.
+        trigger_rule="all_success",
+        retries=2,
         doc_md="Rewrites small files and expires snapshots older than 7 days.",
     )
 
@@ -148,7 +213,10 @@ with DAG(
     throughput = BashOperator(
         task_id="throughput_ledger",
         bash_command=f"cd {PROJECT} && python tests/report_throughput.py",
-        trigger_rule="all_done",
+        # all_success for the same reason as compact_tables: a throughput
+        # report written after a failed gate documents a run that did not
+        # happen.
+        trigger_rule="all_success",
         doc_md=(
             "Bytes processed survives raw expiry in the manifest. This is the "
             "ledger behind any volume claim."

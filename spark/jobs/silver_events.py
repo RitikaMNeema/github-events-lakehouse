@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import timedelta
 
 from pyspark.sql import DataFrame, functions as F
 
@@ -65,7 +66,18 @@ CREATE TABLE IF NOT EXISTS {cat}.silver.events (
     processed_at    TIMESTAMP
 )
 USING iceberg
-PARTITIONED BY (days(event_ts))
+-- hours(), not days().
+--
+-- The partition grain must match the BATCH grain. Silver is merged one hour
+-- at a time, but with days(event_ts) every one of those merges had to scan
+-- the entire day already present: by hour 20 that was ~3.2M rows, so a
+-- 24-hour backfill was O(n^2) and OOM-killed the driver. With hours(), a
+-- merge scoped to one hour prunes to a handful of hour partitions, so cost
+-- is proportional to the batch instead of the table.
+--
+-- Day-level queries still prune: Iceberg's hours() transform satisfies a
+-- date predicate by pruning all 24 of that day's partitions.
+PARTITIONED BY (hours(event_ts))
 TBLPROPERTIES (
     'write.format.default'            = 'parquet',
     'write.parquet.compression-codec' = 'zstd',
@@ -90,7 +102,7 @@ CREATE TABLE IF NOT EXISTS {cat}.silver.commits (
     processed_at TIMESTAMP
 )
 USING iceberg
-PARTITIONED BY (days(event_ts))
+PARTITIONED BY (hours(event_ts))   -- see silver.events: batch-aligned grain
 TBLPROPERTIES ('write.format.default'='parquet',
                'write.parquet.compression-codec'='zstd',
                'format-version'='2')
@@ -180,6 +192,10 @@ def _process_hour(spark, cat: str, hour) -> None:
     Per-hour also means each hour is its own set of commits, so a failure
     part way through a backfill leaves every completed hour intact.
     """
+    # Event-time window for the merge predicates above.
+    lo = (hour - timedelta(hours=2)).strftime("%Y-%m-%d %H:00:00")
+    hi = (hour + timedelta(hours=3)).strftime("%Y-%m-%d %H:00:00")
+
     bronze = spark.table(f"{cat}.bronze.gh_events").where(
         f"ingest_date = date'{hour:%Y-%m-%d}' AND ingest_hour = {hour.hour}"
     )
@@ -231,7 +247,14 @@ def _process_hour(spark, cat: str, hour) -> None:
         f"""
         MERGE INTO {cat}.silver.events t
         USING silver_src s
+          -- The event_ts bound is what lets Iceberg prune the target. Without
+          -- it, matching on event_id alone forces a full-table scan on every
+          -- merge, because event_id carries no partition information.
+          -- Events are stamped by the source within their own hour; a +/- 2h
+          -- window covers clock skew at the boundaries with room to spare.
           ON t.event_id = s.event_id
+         AND t.event_ts >= timestamp'{lo}'
+         AND t.event_ts <  timestamp'{hi}'
         WHEN MATCHED THEN UPDATE SET {set_clause}
         WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
         """
@@ -286,6 +309,8 @@ def _process_hour(spark, cat: str, hour) -> None:
         MERGE INTO {cat}.silver.commits t
         USING commits_src s
           ON t.event_id = s.event_id AND t.commit_sha = s.commit_sha
+         AND t.event_ts >= timestamp'{lo}'
+         AND t.event_ts <  timestamp'{hi}'
         WHEN NOT MATCHED THEN INSERT *
         """
     )
